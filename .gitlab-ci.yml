@@ -1,0 +1,68 @@
+---
+.cache_bundler: &cache_bundler
+  cache:
+    untracked: true
+    # An attempt at caching ruby between runs (ala Travis CI)
+    key: "${CI_PROJECT_NAMESPACE}__bundler"
+    paths:
+      - '.vendor'
+
+.setup_bundler_env: &setup_bundler_env
+  before_script:
+    - gem install bundler --conservative --no-document
+    - rm -f Gemfile.lock
+    - rm -rf pkg/
+    - bundle check || bundle install --no-binstubs --jobs $(nproc) "${FLAGS[@]}"
+
+stages:
+  - build
+
+build_iso:
+  stage: build
+  <<: *cache_bundler
+  <<: *setup_bundler_env
+  tags:
+    - vagrant
+    - virtualbox
+  # NOTE: variables with default values are assigned in the `script:` section.
+  # The Gitlab CI `variable:` section is processed using Go's `os.Expand()`,
+  # which doesn't support parameter expansion.
+  #
+  # See:
+  #
+  #   https://docs.gitlab.com/ee/ci/variables/where_variables_can_be_used.html#gitlab-runner-internal-variable-expansion-mechanism
+  #
+  # VAGRANT_BUILDER_* = simp-builder vagrant
+  # LOCAL_*_FILE = Hooks for local scripts to custom environment/artifacts
+  variables:
+    BUNDLE_PATH:      .vendor
+    VAGRANT_BOX_NAME: simp_builder__${CI_JOB_NAME}__${CI_JOB_ID}
+    VAGRANT_SSH_CFG:  .ssh-${CI_JOB_NAME}-${CI_JOB_ID}
+  script:
+
+    # variables with default values
+    - export VAGRANT_BUILDER_REPO=${VAGRANT_BUILDER_REPO:-https://github.com/op-ct/insta-simpdev.git}
+    - export VAGRANT_BUILDER_REF=${VAGRANT_BUILDER_REF:-werk}
+    - export LOCAL_SETUP_SCRIPT=${LOCAL_SETUP_SCRIPT:-$PWD/local_setup.sh}
+    - export LOCAL_FINISH_SCRIPT=${LOCAL_FINISH_SCRIPT:-$PWD/local_finish.sh}
+    - export SIMP_BUILDER_debug=${SIMP_BUILDER_debug:-1}
+
+    # set up ISO builder builder
+    - git clone ${VAGRANT_BUILDER_REPO} -b ${VAGRANT_BUILDER_REF} simp-builder
+    - 'test -f "${LOCAL_SETUP_SCRIPT}" && source "${LOCAL_SETUP_SCRIPT}" || echo "== skipping LOCAL_SETUP_SCRIPT: ${LOCAL_SETUP_SCRIPT} not found"'
+    - cd simp-builder
+
+    # build the ISO builder (which then builds the ISO)
+    - vagrant up
+    - vagrant ssh-config > ${VAGRANT_SSH_CFG}
+
+    # retrieve the assets
+    - ssh -F ${VAGRANT_SSH_CFG} ${VAGRANT_BOX_NAME} -- 'tar zcf /vagrant/logs.tgz /vagrant/logs `find /vagrant/simp-core -regex .\*/dist/logs`'
+    - scp -F ${VAGRANT_SSH_CFG} "${VAGRANT_BOX_NAME}:/vagrant/logs.tgz" ./
+    - scp -F ${VAGRANT_SSH_CFG} "${VAGRANT_BOX_NAME}:/vagrant/simp-core/{Puppetfile.*,build/distributions/*/*/*/SIMP_ISO/*{.iso,.json}}" ./
+
+    # perform local finishing actions
+    - cd "${CI_PROJECT_DIR}"
+    - 'test -f "${LOCAL_FINISH_SCRIPT}" && source "${LOCAL_FINISH_SCRIPT}" || echo "== skipping LOCAL_FINISH_SCRIPT: ${LOCAL_FINISH_SCRIPT} not found"'
+  after_script:
+    - test "${VAGRANT_BUILDER_DESTROY}" = 'no' || vagrant destroy -f
